@@ -1,0 +1,14 @@
+python generate_soft_label.py \
+    -a resnet18 \
+    -b 1024 \
+    -j 8 \
+    --epochs 300 \
+    --fkd-seed 42 \
+    --input-size 224 \
+    --min-scale-crops 0.08 \
+    --max-scale-crops 1 \
+    --use-fp16 \
+    --fkd-path /home/test_yanjunchi/wangshaobo/DD/SRe2L/SRe2L/relabel/labels/tiny-ipc50 \
+    --mode 'fkd_save' \
+    --mix-type 'cutmix' \
+    --data /home/test_yanjunchi/wangshaobo/DD/Dataset/imagenet/tiny-pic-50
