@@ -6,6 +6,8 @@ import sys
 import time
 import ipdb
 
+from deep_utils import models
+from deep_utils import deep_models
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,7 +18,6 @@ import torchvision.transforms as transforms
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 from torchvision.transforms import InterpolationMode
-from deep_utils import deep_models
 from utils import AverageMeter, accuracy, get_parameters
 
 sys.path.append('..')
@@ -31,7 +32,7 @@ from relabel.utils_fkd import (ComposeWithCoords, ImageFolder_FKD_MIX,
 def get_args():
     parser = argparse.ArgumentParser("FKD Training on ImageNet-1K")
     parser.add_argument('--batch-size', type=int,
-                        default=1024, help='batch size')
+                        default=256, help='batch size')
     parser.add_argument('--gradient-accumulation-steps', type=int,
                         default=1, help='gradient accumulation steps for small gpu memory')
     parser.add_argument('--start-epoch', type=int,
@@ -46,7 +47,6 @@ def get_args():
                         default='/path/to/imagenet/val', help='path to validation dataset')
     parser.add_argument('--output-dir', type=str,
                         default='./save/1024', help='path to output dir')
-    parser.add_argument('--deep_type', type=str, default='resnet18')
     parser.add_argument('--device', type=str,
                         default='cuda:0')
     parser.add_argument('--cos', default=False,
@@ -149,18 +149,21 @@ def main():
     # load student model
     print("=> loading student model '{}'".format(args.model))
     # model = torchvision.models.__dict__[args.model](pretrained=False)
-    model = res
+    model = deep_models.models(args.model).to(args.device)
+    # model = models.resnet18()
     # ipdb.set_trace()
-    model = nn.DataParallel(model).cuda()
+    # model = nn.DataParallel(model).to(args.device)
+    lambdas = torch.Tensor([1.0, 1.0, 1.0])
+    lambdas.requires_grad_(True)
     model.train()
 
     if args.sgd:
-        optimizer = torch.optim.SGD(get_parameters(model),
+        optimizer = torch.optim.SGD(get_parameters(model)+list(lambdas),
                                     lr=args.learning_rate,
                                     momentum=args.momentum,
                                     weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(get_parameters(model),
+    else: # 别忘了改过来
+        optimizer = torch.optim.AdamW(list(model.parameters())+list(lambdas),
                                       lr=args.adamw_lr,
                                       weight_decay=args.adamw_weight_decay)
 
@@ -184,7 +187,7 @@ def main():
         global wandb_metrics
         wandb_metrics = {}
 
-        train(model, args, epoch)
+        train(model, args, epoch, lambdas)
 
         if epoch % 10 == 0 or epoch == args.epochs - 1:
             top1 = validate(model, args, epoch)
@@ -212,7 +215,7 @@ def adjust_bn_momentum(model, iters):
             m.momentum = 1 / iters
 
 
-def train(model, args, epoch=None):
+def train(model, args, epoch=None, lambdas=None):
     objs = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
@@ -220,6 +223,7 @@ def train(model, args, epoch=None):
     optimizer = args.optimizer
     scheduler = args.scheduler
     loss_function_kl = nn.KLDivLoss(reduction='batchmean')
+    # lambdas = [1, 1, 1]
 
     model.train()
     t1 = time.time()
@@ -228,9 +232,9 @@ def train(model, args, epoch=None):
         images, target, flip_status, coords_status = batch_data[0]
         mix_index, mix_lam, mix_bbox, soft_label = batch_data[1:]
 
-        images = images.cuda()
-        target = target.cuda()
-        soft_label = soft_label.cuda().float()  # convert to float32
+        images = images.to(args.device)
+        target = target.to(args.device)
+        soft_label = soft_label.to(args.device).float()  # convert to float32
         images, _, _, _ = mix_aug(images, args, mix_index, mix_lam, mix_bbox)
 
         optimizer.zero_grad()
@@ -242,57 +246,43 @@ def train(model, args, epoch=None):
             accum_step = math.ceil(images.shape[0] / small_bs)
         else:
             accum_step = args.gradient_accumulation_steps
-
+        for name, param in model.named_parameters():
+            if torch.any(torch.isnan(param)):
+                print(f"Warning: Parameter {name} contains NaN values after optimizer step!")
+        # ipdb.set_trace()
         for accum_id in range(accum_step):
             partial_images = images[accum_id * small_bs: (accum_id + 1) * small_bs]
             partial_target = target[accum_id * small_bs: (accum_id + 1) * small_bs]
             partial_soft_label = soft_label[accum_id * small_bs: (accum_id + 1) * small_bs]
 
             output = model(partial_images)
-            prec1, prec5 = accuracy(output, partial_target, topk=(1, 5))
-
-            output = F.log_softmax(output/args.temperature, dim=1)
+            prec1, prec5 = accuracy(output[-1], partial_target, topk=(1, 5))
             partial_soft_label = F.softmax(partial_soft_label/args.temperature, dim=1)
-            loss = loss_function_kl(output, partial_soft_label)
+            
+            output_part = F.log_softmax(output[-1]/args.temperature+1e-8, dim=1)
+            loss = loss_function_kl(output_part, partial_soft_label)
+            # ipdb.set_trace()
+            for output_part, l in zip(output[:-1], lambdas): # 虽然有点奇怪，先这么用，不然有bug
+                # output_part = output_part - output_part.max(dim=1, keepdim=True)[0]
+                output_part = F.log_softmax(output_part/args.temperature+1e-8, dim=1)  
+                # if torch.any(torch.isnan(output_part)): # 总会有nan值
+                #     print('111')
+                #     continue
+                loss += l * loss_function_kl(output_part, partial_soft_label)
+                # ipdb.set_trace()
             # loss = loss * args.temperature * args.temperature
             loss = loss / args.gradient_accumulation_steps
             loss.backward()
-
+            
             n = partial_images.size(0)
             objs.update(loss.item(), n)
             top1.update(prec1.item(), n)
             top5.update(prec5.item(), n)
 
+        # 梯度裁剪，限制梯度的最大范数
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
-
-
-        # output = model(images)
-        # prec1, prec5 = accuracy(output, target, topk=(1, 5))
-        # output = F.log_softmax(output/args.temperature, dim=1)
-        # soft_label = F.softmax(soft_label/args.temperature, dim=1)
-
-        # loss = loss_function_kl(output, soft_label)
-        # # loss = loss * args.temperature * args.temperature
-
-        # n = images.size(0)
-        # objs.update(loss.item(), n)
-        # top1.update(prec1.item(), n)
-        # top5.update(prec5.item(), n)
-
-        # if batch_idx == 0:
-        #     optimizer.zero_grad()
-
-        # # do not support accumulate gradient, batch_size is fixed to 1024
-        # assert args.gradient_accumulation_steps == 1
-        # if args.gradient_accumulation_steps > 1:
-        #     loss = loss / args.gradient_accumulation_steps
-
-        # loss.backward()
-
-        # if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or batch_idx == len(args.train_loader) - 1:
-        #     optimizer.step()
-        #     optimizer.zero_grad()
 
     metrics = {
         "train/loss": objs.avg,
@@ -322,9 +312,9 @@ def validate(model, args, epoch=None):
     with torch.no_grad():
         for data, target in args.val_loader:
             target = target.type(torch.LongTensor)
-            data, target = data.cuda(), target.cuda()
+            data, target = data.to(args.device), target.to(args.device)
 
-            output = model(data)
+            output = model(data)[-1]
             loss = loss_function(output, target)
 
             prec1, prec5 = accuracy(output, target, topk=(1, 5))
